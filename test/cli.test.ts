@@ -24,6 +24,7 @@ const originalZaiProvider = PROVIDERS.zai;
 const originalAgyProvider = PROVIDERS.agy;
 const originalAlibabaProvider = PROVIDERS.alibaba;
 const originalOpenCodeGoProvider = PROVIDERS["opencode-go"];
+const originalOpenRouterProvider = PROVIDERS.openrouter;
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 const originalCodexHome = process.env.CODEX_HOME;
@@ -40,6 +41,7 @@ afterEach(() => {
   PROVIDERS.agy = originalAgyProvider;
   PROVIDERS.alibaba = originalAlibabaProvider;
   PROVIDERS["opencode-go"] = originalOpenCodeGoProvider;
+  PROVIDERS.openrouter = originalOpenRouterProvider;
   if (originalXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
   else process.env.XDG_CACHE_HOME = originalXdgCacheHome;
   if (originalClaudeConfigDir === undefined)
@@ -66,6 +68,7 @@ describe("CLI flag parsing", () => {
       "agy",
       "alibaba",
       "opencode-go",
+      "openrouter",
     ]);
   });
 
@@ -103,6 +106,7 @@ describe("CLI flag parsing", () => {
           "agy",
           "alibaba",
           "opencode-go",
+          "openrouter",
         ],
         json: true,
         full: true,
@@ -884,6 +888,7 @@ describe("default TOON decision blocks", () => {
     PROVIDERS.agy = providerWithQuota(unavailableAgyQuota());
     PROVIDERS.alibaba = providerWithQuota(freshAlibabaQuota());
     PROVIDERS["opencode-go"] = providerWithQuota(freshOpenCodeGoQuota());
+    PROVIDERS.openrouter = providerWithQuota(freshOpenRouterQuota());
 
     const output = await capture([]);
     const named = new Set([
@@ -901,6 +906,7 @@ describe("default TOON decision blocks", () => {
       "grok",
       "kimi",
       "opencode-go",
+      "openrouter",
       "zai",
     ]);
   });
@@ -1258,6 +1264,7 @@ describe("CLI plumbing via the axi SDK", () => {
     PROVIDERS.agy = providerWithAuth("agy", "Antigravity");
     PROVIDERS.alibaba = providerWithAuth("alibaba", "Alibaba Coding Plan");
     PROVIDERS["opencode-go"] = providerWithAuth("opencode-go", "OpenCode Go");
+    PROVIDERS.openrouter = providerWithAuth("openrouter", "OpenRouter");
 
     const output = await capture(["--allow-keychain-prompt", "auth"]);
     expect(output).toContain(
@@ -1767,6 +1774,40 @@ function freshZaiQuota(): ProviderQuota {
       sourcesTried: ["opencode:auth.json"],
     },
     attempts: [{ source: "opencode:auth.json", status: "success" }],
+  };
+}
+
+function freshOpenRouterQuota(): ProviderQuota {
+  return {
+    provider: "openrouter",
+    label: "OpenRouter",
+    source: "api",
+    windows: [
+      {
+        id: "limit",
+        label: "day",
+        kind: "credits",
+        percentUsed: 25,
+        percentRemaining: 75,
+        spentUsd: 20,
+        limitUsd: 80,
+        windowSeconds: 86400,
+        resetText: "daily",
+      },
+      {
+        id: "usage_monthly",
+        label: "month usage",
+        kind: "credits",
+        spentUsd: 480.75,
+      },
+    ],
+    state: {
+      status: "fresh",
+      stale: false,
+      refreshedAt: "2026-07-06T18:10:00Z",
+      sourcesTried: ["pi:openrouter"],
+    },
+    attempts: [{ source: "pi:openrouter", status: "success" }],
   };
 }
 

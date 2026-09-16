@@ -83,6 +83,7 @@ describe("quota semantics", () => {
       ["grok", [window("credits", "credits", 44)]],
       ["kimi", [window("weekly", "weekly", 59)]],
       ["zai", [window("weekly", "weekly", 42)]],
+      ["openrouter", [window("limit", "credits", 44)]],
       ["agy", [window("gemini_weekly", "weekly", 98)]],
       ["cursor", [window("included_usage", "monthly", 72)]],
       ["copilot", [window("premium_interactions", "monthly", 81)]],
@@ -749,6 +750,100 @@ describe("quota semantics", () => {
           worstReserveWindowId: "mcp_month",
           worstReservePercentPoints: -65,
         }),
+      }),
+    ]);
+  });
+
+  it("bounds OpenRouter models by the key limit while usage meters stay non-binding", () => {
+    const result = withQuotaSemantics(
+      provider("openrouter", [
+        {
+          id: "limit",
+          label: "day",
+          kind: "credits",
+          percentUsed: 25,
+          percentRemaining: 75,
+          spentUsd: 20,
+          limitUsd: 80,
+          windowSeconds: 86_400,
+          resetText: "daily",
+        },
+        {
+          id: "usage_daily",
+          label: "day usage",
+          kind: "credits",
+          spentUsd: 20,
+        },
+        {
+          id: "usage_monthly",
+          label: "month usage",
+          kind: "credits",
+          spentUsd: 480,
+        },
+      ]),
+      GENERATED_AT,
+    );
+
+    expect(result.quotaSemantics?.status).toBe("known");
+    expect(result.quotaSemantics?.unresolvedWindowIds).toBeUndefined();
+    expect(result.quotaSemantics?.effectiveAvailability).toEqual([
+      expect.objectContaining({
+        scope: "all_models",
+        status: "known",
+        effectivePercentRemaining: 75,
+        boundedBy: ["limit"],
+        limitingWindowIds: ["limit"],
+        // The endpoint reports no reset timestamp, so pace, runway, and
+        // selection stay unknown rather than inventing a cycle phase.
+        runway: expect.objectContaining({ status: "unknown" }),
+        selection: expect.objectContaining({ status: "unknown" }),
+      }),
+    ]);
+  });
+
+  it("reports no OpenRouter availability for an unlimited key's usage meters", () => {
+    const result = withQuotaSemantics(
+      provider("openrouter", [
+        { id: "usage_daily", label: "day usage", kind: "credits", spentUsd: 3 },
+        {
+          id: "usage_weekly",
+          label: "week usage",
+          kind: "credits",
+          spentUsd: 12,
+        },
+      ]),
+      GENERATED_AT,
+    );
+
+    expect(result.quotaSemantics?.status).toBe("unknown");
+    expect(result.quotaSemantics?.effectiveAvailability).toEqual([]);
+    expect(result.quotaSemantics?.unresolvedWindowIds).toBeUndefined();
+  });
+
+  it("keeps an unfamiliar OpenRouter window out of the key-limit bound", () => {
+    const result = withQuotaSemantics(
+      provider("openrouter", [
+        window("limit", "credits", 60),
+        window("mystery", "unknown", 50),
+      ]),
+      GENERATED_AT,
+    );
+
+    expect(result.quotaSemantics?.status).toBe("partial");
+    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual(["mystery"]);
+    expect(result.quotaSemantics?.effectiveAvailability).toEqual([
+      expect.objectContaining({
+        scope: "all_models",
+        status: "unknown",
+        boundedBy: ["limit"],
+        runway: {
+          status: "unknown",
+          unmeasurableWindowIds: ["limit", "mystery"],
+        },
+        selection: {
+          status: "unknown",
+          unmeasurableWindowIds: ["limit", "mystery"],
+        },
       }),
     ]);
   });

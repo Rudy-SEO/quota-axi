@@ -157,7 +157,50 @@ function semanticsFor(
       return alibabaSemantics(provider.windows, generatedAt);
     case "opencode-go":
       return opencodeGoSemantics(provider.windows, generatedAt);
+    case "openrouter":
+      return openrouterSemantics(provider.windows, generatedAt);
   }
+}
+
+/**
+ * OpenRouter's key spend limit is the one enforced bound the key-status
+ * endpoint reports: a key whose remaining limit reaches zero is refused, so it
+ * binds every model served through the key. The daily, weekly, and monthly
+ * usage windows are spend meters over the same credit spend with no cap of
+ * their own, so they are recognized without becoming bounds.
+ */
+function openrouterSemantics(
+  windows: QuotaWindow[],
+  generatedAt: string,
+): QuotaSemantics {
+  const bound = windows.filter(({ id }) => id === "limit");
+  const meters = windows.filter(({ id }) =>
+    ["usage_daily", "usage_weekly", "usage_monthly"].includes(id),
+  );
+  const recognized = new Set([...bound, ...meters]);
+  const unresolved = windows.filter((window) => !recognized.has(window));
+  if (unresolved.length > 0) {
+    return {
+      status: "partial",
+      description:
+        "OpenRouter's key spend limit bounds every model served through the key and the usage windows are uncapped spend meters, but unfamiliar windows prevent a definitive effective percentage.",
+      effectiveAvailability:
+        bound.length > 0
+          ? [
+              unresolvedAvailability(
+                "all_models",
+                bound,
+                unresolved.map(({ id }) => id),
+              ),
+            ]
+          : [],
+      unresolvedWindowIds: unresolved.map(({ id }) => id),
+    };
+  }
+  return knownSemantics(
+    bound.length > 0 ? [availability("all_models", bound, generatedAt)] : [],
+    "OpenRouter's key spend limit bounds every model served through the key, so effective remaining is the limit window's remaining share. The daily, weekly, and monthly usage windows are uncapped spend meters over the same credit spend and add no bound of their own.",
+  );
 }
 
 /**
