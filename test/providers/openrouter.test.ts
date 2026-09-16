@@ -224,7 +224,7 @@ describe("OpenRouter request transport", () => {
 
 describe("OpenRouter payload normalization", () => {
   it("maps the key record to a daily limit window plus usage meters", () => {
-    expect(normalizeOpenRouterPayload(KEY_PAYLOAD)).toEqual([
+    expect(normalizeOpenRouterPayload(KEY_PAYLOAD, NOW)).toEqual([
       {
         id: "limit",
         label: "day",
@@ -233,7 +233,8 @@ describe("OpenRouter payload normalization", () => {
         percentUsed: 23.125,
         spentUsd: 18.5,
         limitUsd: 80,
-        windowSeconds: 86_400,
+        startsAt: "2026-09-16T00:00:00.000Z",
+        resetsAt: "2026-09-17T00:00:00.000Z",
         resetText: "daily",
       },
       {
@@ -241,34 +242,87 @@ describe("OpenRouter payload normalization", () => {
         label: "day usage",
         kind: "credits",
         spentUsd: 18.5,
+        startsAt: "2026-09-16T00:00:00.000Z",
+        resetsAt: "2026-09-17T00:00:00.000Z",
       },
       {
         id: "usage_weekly",
         label: "week usage",
         kind: "credits",
         spentUsd: 120.25,
+        startsAt: "2026-09-14T00:00:00.000Z",
+        resetsAt: "2026-09-21T00:00:00.000Z",
       },
       {
         id: "usage_monthly",
         label: "month usage",
         kind: "credits",
         spentUsd: 480.75,
+        startsAt: "2026-09-01T00:00:00.000Z",
+        resetsAt: "2026-10-01T00:00:00.000Z",
       },
     ]);
   });
 
-  it("reports only usage meters for an unlimited key", () => {
-    const windows = normalizeOpenRouterPayload({
+  it("resolves UTC periods at their day, Monday-week, and month boundaries", () => {
+    const payload = {
       data: {
-        limit: null,
-        limit_remaining: null,
-        limit_reset: null,
-        usage: 12.5,
-        usage_daily: 1.25,
-        usage_weekly: 4.5,
-        usage_monthly: 9.75,
+        limit: 10,
+        limit_remaining: 5,
+        limit_reset: "weekly",
+        usage_daily: 1,
+        usage_monthly: 2,
       },
+    };
+    const periods = (now: string) =>
+      normalizeOpenRouterPayload(payload, Date.parse(now)).map(
+        ({ id, startsAt, resetsAt }) => ({ id, startsAt, resetsAt }),
+      );
+
+    expect(periods("2026-12-31T23:59:59.999Z")).toEqual([
+      {
+        id: "limit",
+        startsAt: "2026-12-28T00:00:00.000Z",
+        resetsAt: "2027-01-04T00:00:00.000Z",
+      },
+      {
+        id: "usage_daily",
+        startsAt: "2026-12-31T00:00:00.000Z",
+        resetsAt: "2027-01-01T00:00:00.000Z",
+      },
+      {
+        id: "usage_monthly",
+        startsAt: "2026-12-01T00:00:00.000Z",
+        resetsAt: "2027-01-01T00:00:00.000Z",
+      },
+    ]);
+    expect(periods("2026-09-20T23:00:00.000Z")[0]).toEqual({
+      id: "limit",
+      startsAt: "2026-09-14T00:00:00.000Z",
+      resetsAt: "2026-09-21T00:00:00.000Z",
     });
+    expect(periods("2026-09-21T00:00:00.000Z")[0]).toEqual({
+      id: "limit",
+      startsAt: "2026-09-21T00:00:00.000Z",
+      resetsAt: "2026-09-28T00:00:00.000Z",
+    });
+  });
+
+  it("reports only usage meters for an unlimited key", () => {
+    const windows = normalizeOpenRouterPayload(
+      {
+        data: {
+          limit: null,
+          limit_remaining: null,
+          limit_reset: null,
+          usage: 12.5,
+          usage_daily: 1.25,
+          usage_weekly: 4.5,
+          usage_monthly: 9.75,
+        },
+      },
+      NOW,
+    );
     expect(windows.map(({ id }) => id)).toEqual([
       "usage_daily",
       "usage_weekly",
@@ -279,14 +333,18 @@ describe("OpenRouter payload normalization", () => {
     ).toBe(true);
   });
 
-  it("labels a weekly-reset limit with its trusted duration", () => {
-    const [window] = normalizeOpenRouterPayload({
-      data: { limit: 100, limit_remaining: 25, limit_reset: "weekly" },
-    });
+  it("labels a weekly-reset limit with its current UTC week", () => {
+    const [window] = normalizeOpenRouterPayload(
+      {
+        data: { limit: 100, limit_remaining: 25, limit_reset: "weekly" },
+      },
+      NOW,
+    );
     expect(window).toMatchObject({
       id: "limit",
       label: "week",
-      windowSeconds: 604_800,
+      startsAt: "2026-09-14T00:00:00.000Z",
+      resetsAt: "2026-09-21T00:00:00.000Z",
       resetText: "weekly",
       percentRemaining: 25,
       percentUsed: 75,
@@ -295,33 +353,43 @@ describe("OpenRouter payload normalization", () => {
     });
   });
 
-  it("keeps a monthly-reset limit without inventing a duration", () => {
-    const [window] = normalizeOpenRouterPayload({
-      data: { limit: 100, limit_remaining: 40, limit_reset: "monthly" },
-    });
+  it("resolves a monthly-reset limit to its calendar month", () => {
+    const [window] = normalizeOpenRouterPayload(
+      {
+        data: { limit: 100, limit_remaining: 40, limit_reset: "monthly" },
+      },
+      NOW,
+    );
     expect(window).toMatchObject({
       id: "limit",
       label: "month",
+      startsAt: "2026-09-01T00:00:00.000Z",
+      resetsAt: "2026-10-01T00:00:00.000Z",
       resetText: "monthly",
     });
-    expect(window.windowSeconds).toBeUndefined();
   });
 
   it("treats a limit without a recognized reset cadence as a credit cap", () => {
     for (const limit_reset of [undefined, null, "fortnightly"]) {
-      const [window] = normalizeOpenRouterPayload({
-        data: { limit: 50, limit_remaining: 20, limit_reset },
-      });
+      const [window] = normalizeOpenRouterPayload(
+        {
+          data: { limit: 50, limit_remaining: 20, limit_reset },
+        },
+        NOW,
+      );
       expect(window).toMatchObject({ id: "limit", label: "credits" });
-      expect(window.windowSeconds).toBeUndefined();
+      expect(window.resetsAt).toBeUndefined();
       expect(window.resetText).toBeUndefined();
     }
   });
 
   it("reports a zeroed limit as fully used", () => {
-    const [window] = normalizeOpenRouterPayload({
-      data: { limit: 0, limit_remaining: 0, limit_reset: "daily" },
-    });
+    const [window] = normalizeOpenRouterPayload(
+      {
+        data: { limit: 0, limit_remaining: 0, limit_reset: "daily" },
+      },
+      NOW,
+    );
     expect(window).toMatchObject({
       id: "limit",
       percentRemaining: 0,
@@ -331,9 +399,12 @@ describe("OpenRouter payload normalization", () => {
   });
 
   it("clamps an overdrawn negative remaining to zero percent", () => {
-    const [window] = normalizeOpenRouterPayload({
-      data: { limit: 80, limit_remaining: -5, limit_reset: "daily" },
-    });
+    const [window] = normalizeOpenRouterPayload(
+      {
+        data: { limit: 80, limit_remaining: -5, limit_reset: "daily" },
+      },
+      NOW,
+    );
     expect(window).toMatchObject({
       id: "limit",
       percentRemaining: 0,
@@ -344,9 +415,12 @@ describe("OpenRouter payload normalization", () => {
   });
 
   it("omits percentages when the remaining limit is not reported", () => {
-    const [window] = normalizeOpenRouterPayload({
-      data: { limit: 80, limit_reset: "daily" },
-    });
+    const [window] = normalizeOpenRouterPayload(
+      {
+        data: { limit: 80, limit_reset: "daily" },
+      },
+      NOW,
+    );
     expect(window).toMatchObject({ id: "limit", limitUsd: 80 });
     expect(window.percentRemaining).toBeUndefined();
     expect(window.percentUsed).toBeUndefined();
@@ -354,31 +428,37 @@ describe("OpenRouter payload normalization", () => {
   });
 
   it("tolerates a missing envelope by reading the record from the root", () => {
-    const windows = normalizeOpenRouterPayload({
-      limit: 10,
-      limit_remaining: 5,
-      limit_reset: "daily",
-    });
+    const windows = normalizeOpenRouterPayload(
+      {
+        limit: 10,
+        limit_remaining: 5,
+        limit_reset: "daily",
+      },
+      NOW,
+    );
     expect(windows.map(({ id }) => id)).toEqual(["limit"]);
   });
 
   it("skips negative and non-numeric usage meters", () => {
-    const windows = normalizeOpenRouterPayload({
-      data: {
-        limit: 10,
-        limit_remaining: 5,
-        usage_daily: -1,
-        usage_weekly: "not-a-number",
-        usage_monthly: 3,
+    const windows = normalizeOpenRouterPayload(
+      {
+        data: {
+          limit: 10,
+          limit_remaining: 5,
+          usage_daily: -1,
+          usage_weekly: "not-a-number",
+          usage_monthly: 3,
+        },
       },
-    });
+      NOW,
+    );
     expect(windows.map(({ id }) => id)).toEqual(["limit", "usage_monthly"]);
   });
 
   it("throws schema_invalid for a record with no recognized field", () => {
-    expect(() => normalizeOpenRouterPayload({ data: {} })).toThrow();
-    expect(() => normalizeOpenRouterPayload([])).toThrow();
-    expect(() => normalizeOpenRouterPayload(undefined)).toThrow();
+    expect(() => normalizeOpenRouterPayload({ data: {} }, NOW)).toThrow();
+    expect(() => normalizeOpenRouterPayload([], NOW)).toThrow();
+    expect(() => normalizeOpenRouterPayload(undefined, NOW)).toThrow();
   });
 });
 
@@ -597,31 +677,43 @@ describe("OpenRouter cache fallback", () => {
     expect(report.source).toBe("unavailable");
   });
 
-  it("expires cached windows at their per-window age limits", async () => {
-    const windows = [
-      limitWindow(),
-      usageWindow("usage_daily"),
-      usageWindow("usage_monthly"),
-    ];
-    const justBeforeDay = await transientWithCache(
-      cachedQuota(windows, NOW - 86_400_000 + 1),
+  it("expires cached windows at their UTC reset boundaries", async () => {
+    const lateReading = Date.parse("2026-09-15T23:30:00.000Z");
+    const windows = normalizeOpenRouterPayload(
+      { data: { ...KEY_PAYLOAD.data, limit_remaining: 0 } },
+      lateReading,
     );
-    expect(justBeforeDay.windows.map(({ id }) => id).sort()).toEqual([
+
+    const beforeMidnight = await testAdapter({
+      fetch: vi.fn(async () => new Response(null, { status: 503 })),
+      readCachedProvider: () => cachedQuota(windows, lateReading),
+      now: () => Date.parse("2026-09-15T23:59:00.000Z"),
+    }).fetchQuota(OPTIONS);
+    expect(beforeMidnight.windows.map(({ id }) => id)).toEqual([
       "limit",
       "usage_daily",
+      "usage_weekly",
       "usage_monthly",
     ]);
 
-    const atDay = await transientWithCache(
-      cachedQuota(windows, NOW - 86_400_000),
-    );
-    expect(atDay.windows.map(({ id }) => id).sort()).toEqual(["usage_monthly"]);
+    const afterMidnight = await testAdapter({
+      fetch: vi.fn(async () => new Response(null, { status: 503 })),
+      readCachedProvider: () => cachedQuota(windows, lateReading),
+      now: () => Date.parse("2026-09-16T00:15:00.000Z"),
+    }).fetchQuota(OPTIONS);
+    expect(afterMidnight.state.status).toBe("stale");
+    expect(afterMidnight.windows.map(({ id }) => id)).toEqual([
+      "usage_weekly",
+      "usage_monthly",
+    ]);
 
-    const atMonth = await transientWithCache(
-      cachedQuota(windows, NOW - 30 * 24 * 60 * 60 * 1_000),
-    );
-    expect(atMonth.state.status).toBe("error");
-    expect(atMonth.windows).toEqual([]);
+    const afterMonth = await testAdapter({
+      fetch: vi.fn(async () => new Response(null, { status: 503 })),
+      readCachedProvider: () => cachedQuota(windows, lateReading),
+      now: () => Date.parse("2026-10-01T00:00:00.000Z"),
+    }).fetchQuota(OPTIONS);
+    expect(afterMonth.state.status).toBe("error");
+    expect(afterMonth.windows).toEqual([]);
   });
 
   it("bounds a cadence-less cached limit window at a month", async () => {
@@ -730,7 +822,8 @@ function limitWindow(): QuotaWindow {
     percentRemaining: 76.875,
     spentUsd: 18.5,
     limitUsd: 80,
-    windowSeconds: 86_400,
+    startsAt: "2026-09-16T00:00:00.000Z",
+    resetsAt: "2026-09-17T00:00:00.000Z",
     resetText: "daily",
   };
 }
@@ -743,7 +836,13 @@ function usageWindow(
     usage_weekly: "week usage",
     usage_monthly: "month usage",
   } as const;
-  return { id, label: labels[id], kind: "credits", spentUsd: 10 };
+  return {
+    id,
+    label: labels[id],
+    kind: "credits",
+    spentUsd: 10,
+    resetsAt: "2026-10-01T00:00:00.000Z",
+  };
 }
 
 function cachedQuota(

@@ -754,7 +754,7 @@ describe("quota semantics", () => {
     ]);
   });
 
-  it("bounds OpenRouter models by the key limit while usage meters stay non-binding", () => {
+  it("keeps OpenRouter's key-limit headroom unknown behind the unreported account credit", () => {
     const result = withQuotaSemantics(
       provider("openrouter", [
         {
@@ -765,7 +765,8 @@ describe("quota semantics", () => {
           percentRemaining: 75,
           spentUsd: 20,
           limitUsd: 80,
-          windowSeconds: 86_400,
+          startsAt: "2026-07-15T00:00:00.000Z",
+          resetsAt: "2026-07-16T00:00:00.000Z",
           resetText: "daily",
         },
         {
@@ -773,32 +774,51 @@ describe("quota semantics", () => {
           label: "day usage",
           kind: "credits",
           spentUsd: 20,
+          startsAt: "2026-07-15T00:00:00.000Z",
+          resetsAt: "2026-07-16T00:00:00.000Z",
         },
         {
           id: "usage_monthly",
           label: "month usage",
           kind: "credits",
           spentUsd: 480,
+          startsAt: "2026-07-01T00:00:00.000Z",
+          resetsAt: "2026-08-01T00:00:00.000Z",
         },
       ]),
       GENERATED_AT,
     );
 
-    expect(result.quotaSemantics?.status).toBe("known");
-    expect(result.quotaSemantics?.unresolvedWindowIds).toBeUndefined();
+    expect(result.quotaSemantics?.status).toBe("partial");
+    expect(result.quotaSemantics?.description).toContain("credit balance");
+    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual([
+      "account_credits",
+    ]);
+    const limit = result.windows.find(({ id }) => id === "limit");
+    expect(limit?.pace).toMatchObject({
+      status: "behind",
+      cycleSeconds: 86_400,
+    });
     expect(result.quotaSemantics?.effectiveAvailability).toEqual([
       expect.objectContaining({
         scope: "all_models",
-        status: "known",
-        effectivePercentRemaining: 75,
+        status: "unknown",
         boundedBy: ["limit"],
-        limitingWindowIds: ["limit"],
-        // The endpoint reports no reset timestamp, so pace, runway, and
-        // selection stay unknown rather than inventing a cycle phase.
-        runway: expect.objectContaining({ status: "unknown" }),
-        selection: expect.objectContaining({ status: "unknown" }),
+        pace: expect.objectContaining({ status: "behind" }),
+        runway: {
+          status: "unknown",
+          unmeasurableWindowIds: ["limit", "account_credits"],
+        },
+        selection: {
+          status: "unknown",
+          unmeasurableWindowIds: ["limit", "account_credits"],
+        },
       }),
     ]);
+    expect(
+      result.quotaSemantics?.effectiveAvailability[0]
+        ?.effectivePercentRemaining,
+    ).toBeUndefined();
   });
 
   it("reports no OpenRouter availability for an unlimited key's usage meters", () => {
@@ -815,9 +835,11 @@ describe("quota semantics", () => {
       GENERATED_AT,
     );
 
-    expect(result.quotaSemantics?.status).toBe("unknown");
+    expect(result.quotaSemantics?.status).toBe("partial");
     expect(result.quotaSemantics?.effectiveAvailability).toEqual([]);
-    expect(result.quotaSemantics?.unresolvedWindowIds).toBeUndefined();
+    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual([
+      "account_credits",
+    ]);
   });
 
   it("keeps an unfamiliar OpenRouter window out of the key-limit bound", () => {
@@ -830,7 +852,10 @@ describe("quota semantics", () => {
     );
 
     expect(result.quotaSemantics?.status).toBe("partial");
-    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual(["mystery"]);
+    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual([
+      "mystery",
+      "account_credits",
+    ]);
     expect(result.quotaSemantics?.effectiveAvailability).toEqual([
       expect.objectContaining({
         scope: "all_models",
@@ -838,11 +863,11 @@ describe("quota semantics", () => {
         boundedBy: ["limit"],
         runway: {
           status: "unknown",
-          unmeasurableWindowIds: ["limit", "mystery"],
+          unmeasurableWindowIds: ["limit", "mystery", "account_credits"],
         },
         selection: {
           status: "unknown",
-          unmeasurableWindowIds: ["limit", "mystery"],
+          unmeasurableWindowIds: ["limit", "mystery", "account_credits"],
         },
       }),
     ]);

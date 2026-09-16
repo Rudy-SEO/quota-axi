@@ -63,16 +63,30 @@ type AttentionRow = {
   remedy: string;
 };
 
+/**
+ * Sparse: one row per fresh window that reports a dollar figure, so a spend
+ * meter without a percentage is still visible. `limitUsd` is `none` for a
+ * meter with neither a limit nor a percentage.
+ */
+type SpendRow = {
+  provider: ProviderId;
+  window: string;
+  spentUsd: number | string;
+  limitUsd: number | string;
+};
+
 type ProviderBlocks = {
   quota: QuotaRow[];
   exhaustion: ExhaustionRow[];
   attention: AttentionRow[];
+  spend: SpendRow[];
 };
 
 /**
  * Render the default decision-shaped report: one `quota[]` row per measurable
- * scope, plus the sparse `exhaustion[]` and `attention[]` blocks. `--full` adds
- * the audit blocks. Demotion happens here, never at computation, so `--tui` and
+ * scope, plus the sparse `exhaustion[]` and `attention[]` blocks, and a
+ * `spend[]` block only when a fresh window reports dollars. `--full` adds the
+ * audit blocks. Demotion happens here, never at computation, so `--tui` and
  * the normalized model keep every field.
  */
 export function renderQuotaToon(
@@ -80,7 +94,7 @@ export function renderQuotaToon(
   binPath: string,
   full: boolean,
 ): string {
-  const { quota, exhaustion, attention } = quotaBlocks(response);
+  const { quota, exhaustion, attention, spend } = quotaBlocks(response);
   const blocks = [
     encode({
       bin: collapseHome(binPath),
@@ -92,6 +106,7 @@ export function renderQuotaToon(
     encode({ exhaustion }),
     encode({ attention }),
   ];
+  if (spend.length > 0) blocks.push(encode({ spend }));
 
   if (full) blocks.push(...auditBlocks(response));
   blocks.push(renderHelp(quotaHelpLines(response)));
@@ -103,7 +118,12 @@ export function renderQuotaToon(
  * `quota[]` or `attention[]` or both, and never in metric order.
  */
 function quotaBlocks(response: QuotaAxiResponse): ProviderBlocks {
-  const blocks: ProviderBlocks = { quota: [], exhaustion: [], attention: [] };
+  const blocks: ProviderBlocks = {
+    quota: [],
+    exhaustion: [],
+    attention: [],
+    spend: [],
+  };
   for (const provider of response.providers) {
     const scopes = provider.quotaSemantics?.effectiveAvailability ?? [];
     const scopeAttention: AttentionRow[] = [];
@@ -142,8 +162,26 @@ function quotaBlocks(response: QuotaAxiResponse): ProviderBlocks {
       ...providerAttention(provider, measured, scopeAttention.length),
     );
     blocks.attention.push(...scopeAttention);
+    blocks.spend.push(...spendRows(provider));
   }
   return blocks;
+}
+
+function spendRows(provider: ProviderQuota): SpendRow[] {
+  if (provider.state.stale) return [];
+  return provider.windows
+    .filter(
+      ({ spentUsd, limitUsd }) =>
+        spentUsd !== undefined || limitUsd !== undefined,
+    )
+    .map((window) => ({
+      provider: provider.provider,
+      window: window.id,
+      spentUsd: window.spentUsd ?? UNKNOWN,
+      limitUsd:
+        window.limitUsd ??
+        (window.percentRemaining === undefined ? NONE : UNKNOWN),
+    }));
 }
 
 function quotaRow(

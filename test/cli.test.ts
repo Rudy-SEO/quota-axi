@@ -1109,6 +1109,34 @@ describe("default TOON decision blocks", () => {
     expect(kinds).toContainEqual(["untrusted_windows", "unparsed_limit_2"]);
   });
 
+  it("shows OpenRouter dollars in spend[] and its unreported credit bound in attention[]", async () => {
+    useTempCache();
+    PROVIDERS.openrouter = providerWithQuota(freshOpenRouterQuota());
+
+    const output = await capture(["--provider", "openrouter"]);
+
+    expect(toonRows(output, "quota")).toEqual([]);
+    expect(toonRows(output, "spend")).toEqual([
+      ["openrouter", "limit", "20", "80"],
+      ["openrouter", "usage_monthly", "480.75", "none"],
+    ]);
+    const kinds = toonRows(output, "attention").map((row) => [row[2], row[3]]);
+    expect(kinds).toContainEqual(["unresolved_windows", "account_credits"]);
+    expect(kinds).toContainEqual([
+      "headroom_unknown",
+      "limit + account_credits",
+    ]);
+  });
+
+  it("omits spend[] when no fresh window reports dollars", async () => {
+    useTempCache();
+    PROVIDERS.codex = providerWithQuota(freshCodexQuota());
+
+    const output = await capture(["--provider", "codex"]);
+
+    expect(output).not.toContain("spend[");
+  });
+
   it("drops the audit blocks and the duplicate selection block", async () => {
     useTempCache();
     PROVIDERS.codex = providerWithQuota(freshCodexQuota());
@@ -1791,7 +1819,8 @@ function freshOpenRouterQuota(): ProviderQuota {
         percentRemaining: 75,
         spentUsd: 20,
         limitUsd: 80,
-        windowSeconds: 86400,
+        startsAt: "2026-07-06T00:00:00.000Z",
+        resetsAt: "2026-07-07T00:00:00.000Z",
         resetText: "daily",
       },
       {
@@ -1799,6 +1828,8 @@ function freshOpenRouterQuota(): ProviderQuota {
         label: "month usage",
         kind: "credits",
         spentUsd: 480.75,
+        startsAt: "2026-07-01T00:00:00.000Z",
+        resetsAt: "2026-08-01T00:00:00.000Z",
       },
     ],
     state: {

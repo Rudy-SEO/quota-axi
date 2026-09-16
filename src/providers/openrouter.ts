@@ -25,8 +25,6 @@ const PI_OPENROUTER_PROVIDER_ID = "openrouter";
 const LABEL = "OpenRouter";
 const OPERATION_DEADLINE_MS = 15_000;
 const RESPONSE_LIMIT_BYTES = 262_144;
-const DAY_SECONDS = 86_400;
-const WEEK_SECONDS = 7 * 24 * 60 * 60;
 const MONTH_SECONDS = 30 * 24 * 60 * 60;
 const USER_AGENT = `quota-axi/${VERSION}`;
 
@@ -163,8 +161,9 @@ async function acquireOpenRouterQuota(
       dependencies.fetch,
       dependencies.now,
     );
-    const windows = normalizeOpenRouterPayload(payload);
-    const refreshedAt = new Date(dependencies.now()).toISOString();
+    const receivedAt = dependencies.now();
+    const windows = normalizeOpenRouterPayload(payload, receivedAt);
+    const refreshedAt = new Date(receivedAt).toISOString();
     attempts[attempts.length - 1] = {
       source: PI_OPENROUTER_SOURCE,
       status: "success",
@@ -294,8 +293,16 @@ function staleOpenRouterReport(
   if (!Number.isFinite(refreshedAt)) return undefined;
   const ageMilliseconds = Math.max(0, now - refreshedAt);
   const windows = cached.windows.filter((window) => {
-    const maxAgeSeconds = maxStaleAgeSeconds(window);
-    return maxAgeSeconds > 0 && ageMilliseconds < maxAgeSeconds * 1_000;
+    if (window.resetsAt !== undefined) {
+      const resetsAt = Date.parse(window.resetsAt);
+      return Number.isFinite(resetsAt) && resetsAt > now;
+    }
+    // A limit without a recognized reset cadence is a plain credit cap; a
+    // month is the longest cycle this endpoint describes.
+    return (
+      window.id === OPENROUTER_LIMIT_WINDOW_ID &&
+      ageMilliseconds < MONTH_SECONDS * 1_000
+    );
   });
   if (windows.length === 0) return undefined;
 
@@ -314,24 +321,6 @@ function staleOpenRouterReport(
     },
     attempts,
   };
-}
-
-function maxStaleAgeSeconds(window: QuotaWindow): number {
-  if (window.windowSeconds !== undefined && window.windowSeconds > 0)
-    return window.windowSeconds;
-  switch (window.id) {
-    case "usage_daily":
-      return DAY_SECONDS;
-    case "usage_weekly":
-      return WEEK_SECONDS;
-    // The limit window without a trusted duration has an unknown or monthly
-    // reset cadence; a month is the longest cycle this endpoint describes.
-    case OPENROUTER_LIMIT_WINDOW_ID:
-    case "usage_monthly":
-      return MONTH_SECONDS;
-    default:
-      return 0;
-  }
 }
 
 async function requestOpenRouterKey(
@@ -537,12 +526,15 @@ function createResponseBodyLifetime(response: Response): ResponseBodyLifetime {
  * The key's `limit` / `limit_remaining` pair is the one enforced bound: a key
  * whose remaining limit reaches zero is refused. `limit_reset` names the
  * replenishment cadence as prose (`daily`, `weekly`, `monthly`) with no reset
- * timestamp, so a recognized cadence contributes a trusted cycle duration
- * only where one exists (a calendar month has none) and the cycle phase stays
- * unknown. The `usage_*` fields are spend meters over the same credit spend
- * with no cap of their own, reported as windows without percentages.
+ * timestamp; OpenRouter documents that limits reset at midnight UTC with
+ * Monday-to-Sunday weeks, so a recognized cadence resolves to its current UTC
+ * period. The `usage_*` fields are spend meters over the same UTC day, week,
+ * and month with no cap of their own, reported as windows without percentages.
  */
-export function normalizeOpenRouterPayload(payload: unknown): QuotaWindow[] {
+export function normalizeOpenRouterPayload(
+  payload: unknown,
+  now: number,
+): QuotaWindow[] {
   const root = objectValue(payload);
   const data = objectValue(root?.data) ?? root;
   if (!data || !isKeyRecord(data)) {
@@ -552,43 +544,70 @@ export function normalizeOpenRouterPayload(payload: unknown): QuotaWindow[] {
   const windows: QuotaWindow[] = [];
   const limit = numericScalar(data.limit);
   if (limit !== undefined) {
-    windows.push(limitWindow(limit, data));
+    windows.push(limitWindow(limit, data, now));
   }
   for (const id of OPENROUTER_USAGE_WINDOW_IDS) {
     const spent = numericScalar(data[id]);
     if (spent === undefined || spent < 0) continue;
     windows.push({
       id,
-      label: USAGE_WINDOW_LABELS[id],
+      label: USAGE_WINDOWS[id].label,
       kind: "credits",
       spentUsd: spent,
+      ...utcPeriod(USAGE_WINDOWS[id].period, now),
     });
   }
   return windows;
 }
 
-const USAGE_WINDOW_LABELS: Record<
+type UtcPeriod = "day" | "week" | "month";
+
+const USAGE_WINDOWS: Record<
   (typeof OPENROUTER_USAGE_WINDOW_IDS)[number],
-  string
+  { label: string; period: UtcPeriod }
 > = {
-  usage_daily: "day usage",
-  usage_weekly: "week usage",
-  usage_monthly: "month usage",
+  usage_daily: { label: "day usage", period: "day" },
+  usage_weekly: { label: "week usage", period: "week" },
+  usage_monthly: { label: "month usage", period: "month" },
 };
 
 const LIMIT_RESET_CADENCES: Record<
   string,
-  { label: string; windowSeconds?: number; resetText: string }
+  { label: string; period: UtcPeriod; resetText: string }
 > = {
-  daily: { label: "day", windowSeconds: DAY_SECONDS, resetText: "daily" },
-  weekly: { label: "week", windowSeconds: WEEK_SECONDS, resetText: "weekly" },
-  // A calendar month has no fixed duration, so none is invented.
-  monthly: { label: "month", resetText: "monthly" },
+  daily: { label: "day", period: "day", resetText: "daily" },
+  weekly: { label: "week", period: "week", resetText: "weekly" },
+  monthly: { label: "month", period: "month", resetText: "monthly" },
 };
+
+function utcPeriod(
+  period: UtcPeriod,
+  now: number,
+): Pick<QuotaWindow, "startsAt" | "resetsAt"> {
+  const date = new Date(now);
+  const year = date.getUTCFullYear();
+  const month = date.getUTCMonth();
+  const day = date.getUTCDate();
+  const mondayOffset = (date.getUTCDay() + 6) % 7;
+  const [startsAt, resetsAt] =
+    period === "day"
+      ? [Date.UTC(year, month, day), Date.UTC(year, month, day + 1)]
+      : period === "week"
+        ? [
+            Date.UTC(year, month, day - mondayOffset),
+            Date.UTC(year, month, day - mondayOffset + 7),
+          ]
+        : [Date.UTC(year, month, 1), Date.UTC(year, month + 1, 1)];
+  return {
+    startsAt: new Date(startsAt).toISOString(),
+    resetsAt: new Date(resetsAt).toISOString(),
+  };
+}
 
 function limitWindow(
   limit: number,
   data: Record<string, unknown>,
+  now: number,
 ): QuotaWindow {
   const remaining = numericScalar(data.limit_remaining);
   const cadenceValue = stringValue(data.limit_reset)?.toLowerCase();
@@ -617,10 +636,9 @@ function limitWindow(
       ? { spentUsd: Math.max(0, limit - remaining) }
       : {}),
     limitUsd: limit,
-    ...(cadence?.windowSeconds !== undefined
-      ? { windowSeconds: cadence.windowSeconds }
+    ...(cadence
+      ? { ...utcPeriod(cadence.period, now), resetText: cadence.resetText }
       : {}),
-    ...(cadence ? { resetText: cadence.resetText } : {}),
   };
 }
 

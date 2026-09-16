@@ -158,50 +158,41 @@ function semanticsFor(
     case "opencode-go":
       return opencodeGoSemantics(provider.windows, generatedAt);
     case "openrouter":
-      return openrouterSemantics(provider.windows, generatedAt);
+      return openrouterSemantics(provider.windows);
   }
 }
 
 /**
- * OpenRouter's key spend limit is the one enforced bound the key-status
- * endpoint reports: a key whose remaining limit reaches zero is refused, so it
- * binds every model served through the key. The daily, weekly, and monthly
- * usage windows are spend meters over the same credit spend with no cap of
- * their own, so they are recognized without becoming bounds.
+ * OpenRouter's key spend limit is the one bound the key-status endpoint
+ * reports: a key whose remaining limit reaches zero is refused, so it binds
+ * every model served through the key. The daily, weekly, and monthly usage
+ * windows are spend meters over the same credit spend with no cap of their
+ * own, so they are recognized without becoming bounds. Paid requests are also
+ * bounded by the account's credit balance, which this endpoint does not
+ * report, so that unmodeled bound keeps the scope's headroom unknown.
  */
-function openrouterSemantics(
-  windows: QuotaWindow[],
-  generatedAt: string,
-): QuotaSemantics {
+function openrouterSemantics(windows: QuotaWindow[]): QuotaSemantics {
   const bound = windows.filter(({ id }) => id === "limit");
   const meters = windows.filter(({ id }) =>
     ["usage_daily", "usage_weekly", "usage_monthly"].includes(id),
   );
   const recognized = new Set([...bound, ...meters]);
-  const unresolved = windows.filter((window) => !recognized.has(window));
-  if (unresolved.length > 0) {
-    return {
-      status: "partial",
-      description:
-        "OpenRouter's key spend limit bounds every model served through the key and the usage windows are uncapped spend meters, but unfamiliar windows prevent a definitive effective percentage.",
-      effectiveAvailability:
-        bound.length > 0
-          ? [
-              unresolvedAvailability(
-                "all_models",
-                bound,
-                unresolved.map(({ id }) => id),
-              ),
-            ]
-          : [],
-      unresolvedWindowIds: unresolved.map(({ id }) => id),
-    };
-  }
-  return knownSemantics(
-    bound.length > 0 ? [availability("all_models", bound, generatedAt)] : [],
-    "OpenRouter's key spend limit bounds every model served through the key, so effective remaining is the limit window's remaining share. The daily, weekly, and monthly usage windows are uncapped spend meters over the same credit spend and add no bound of their own.",
-  );
+  const unresolvedWindowIds = [
+    ...windows.filter((window) => !recognized.has(window)).map(({ id }) => id),
+    OPENROUTER_ACCOUNT_CREDITS_ID,
+  ];
+  return {
+    status: "partial",
+    description: `OpenRouter's key spend limit bounds every model served through the key, and the daily, weekly, and monthly usage windows are uncapped spend meters over the same credit spend. Paid requests are also bounded by the account's credit balance (\`${OPENROUTER_ACCOUNT_CREDITS_ID}\`), which the key-status endpoint does not report, so the limit's remaining share is not a definitive effective percentage.`,
+    effectiveAvailability:
+      bound.length > 0
+        ? [unresolvedAvailability("all_models", bound, unresolvedWindowIds)]
+        : [],
+    unresolvedWindowIds,
+  };
 }
+
+const OPENROUTER_ACCOUNT_CREDITS_ID = "account_credits";
 
 /**
  * OpenCode Go's usage endpoint reports the plan's stacked caps: the vendor

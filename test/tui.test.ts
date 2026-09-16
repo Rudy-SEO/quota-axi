@@ -8,6 +8,7 @@ import {
   thinBar,
 } from "../src/tui.js";
 import { withQuotaSemantics } from "../src/interpretation.js";
+import { normalizeOpenRouterPayload } from "../src/providers/openrouter.js";
 import type { ProviderQuota } from "../src/types.js";
 import {
   claudeProvider,
@@ -795,6 +796,63 @@ describe("cards for providers with no combinable bound", () => {
       ).toBe(true);
     },
   );
+});
+
+describe("cards for dollar spend meters", () => {
+  function renderOpenRouter(limit: number | null): string[] {
+    const provider = withQuotaSemantics(
+      {
+        provider: "openrouter",
+        label: "OpenRouter",
+        source: "api",
+        windows: normalizeOpenRouterPayload(
+          {
+            data: {
+              limit,
+              limit_remaining: limit === null ? null : 60,
+              limit_reset: limit === null ? null : "daily",
+              usage_daily: 20,
+              usage_weekly: 95.5,
+              usage_monthly: 480.75,
+            },
+          },
+          Date.parse(GENERATED_AT),
+        ),
+        state: {
+          status: "fresh",
+          stale: false,
+          sourcesTried: ["pi:openrouter"],
+        },
+      },
+      GENERATED_AT,
+    );
+    return renderQuotaTui(
+      { generatedAt: GENERATED_AT, schemaVersion: 5, providers: [provider] },
+      { timeZone: "America/Los_Angeles", columns: CARD_COLUMNS },
+    )
+      .split("\n")
+      .map(stripAnsi);
+  }
+
+  it("labels usage meters apart from the limit row and shows their dollars", () => {
+    const lines = renderOpenRouter(80);
+
+    expect(findLine(lines, "day ")).toContain("75%");
+    expect(findLine(lines, "day usage")).toContain("$20.00 spent");
+    expect(findLine(lines, "week usage")).toContain("$95.50 spent");
+    expect(findLine(lines, "month usage")).toContain("$480.75 spent");
+    expect(findLine(lines, "day: ")).toContain("$20.00 of $80.00 spent");
+    for (const line of lines.filter((line) => line.includes("usage"))) {
+      expect(line).not.toContain("?");
+    }
+  });
+
+  it("keeps an unlimited key's spend visible", () => {
+    const lines = renderOpenRouter(null);
+
+    expect(findLine(lines, "day usage")).toContain("$20.00 spent");
+    expect(findLine(lines, "month usage")).toContain("$480.75 spent");
+  });
 });
 
 describe("thin bars with pace markers", () => {

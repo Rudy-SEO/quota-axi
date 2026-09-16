@@ -449,6 +449,24 @@ function windowRow(window: QuotaWindow, generatedAtMs: number): Line {
   const pct = window.percentRemaining;
   const marker = window.pace?.timeRemainingPercent;
   const reset = resetCountdown(window, generatedAtMs);
+  if (isSpendMeter(window)) {
+    return [
+      { text: "   " },
+      ...padBetween(
+        [
+          {
+            text: sanitizeTerminalText(window.label).toLowerCase(),
+            style: "label",
+          },
+        ],
+        [{ text: spendAmount(window), style: "dim" }],
+        8 + WINDOW_BAR_WIDTH + 5,
+      ),
+      { text: "  " },
+      { text: padEndDisplay(reset, 6), style: "dim" },
+      { text: " " },
+    ];
+  }
   return [
     { text: "   " },
     { text: padEndDisplay(shortWindowLabel(window), 8), style: "label" },
@@ -551,8 +569,32 @@ function runwayVerdict(headline: EffectiveAvailability | undefined): Line {
   return [{ text, style: "warnBold" }];
 }
 
+/**
+ * A dollar meter with no percentage: its row shows the amount in place of an
+ * empty bar, under its full label so it never reads as the capped window.
+ */
+function isSpendMeter(window: QuotaWindow): boolean {
+  return window.percentRemaining === undefined && window.spentUsd !== undefined;
+}
+
+function spendAmount(window: QuotaWindow): string {
+  const spent = window.spentUsd === undefined ? "?" : usd(window.spentUsd);
+  return window.limitUsd === undefined
+    ? `${spent} spent`
+    : `${spent} of ${usd(window.limitUsd)} spent`;
+}
+
+function usd(value: number): string {
+  return `$${value.toFixed(2)}`;
+}
+
 function cardNotes(provider: ProviderQuota): string[] {
-  const notes: string[] = [];
+  const notes: string[] = provider.windows
+    .filter((window) => window.limitUsd !== undefined && !isSpendMeter(window))
+    .map(
+      (window) =>
+        `${sanitizeTerminalText(window.label).toLowerCase()}: ${spendAmount(window)}`,
+    );
   if (provider.state.retryAfter) {
     notes.push(`retry after ${provider.state.retryAfter}`);
   }
