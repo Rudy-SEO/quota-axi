@@ -1,8 +1,12 @@
 import {
-  deleteCachedProvider as deleteCachedProviderFromDisk,
-  readCachedProvider as readCachedProviderFromDisk,
+  deleteCachedOpenRouterProvider as deleteCachedProviderFromDisk,
+  readCachedOpenRouterProvider as readCachedProviderFromDisk,
 } from "../cache.js";
-import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
+import {
+  openrouterCredentialContextId,
+  readJsonFileResult,
+  type JsonFileReadResult,
+} from "../lib/fs.js";
 import { providerFetch } from "../lib/http.js";
 import { resolvePiAuthFilePath } from "../lib/pi-agent-dir.js";
 import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
@@ -25,6 +29,7 @@ const PI_OPENROUTER_PROVIDER_ID = "openrouter";
 const LABEL = "OpenRouter";
 const OPERATION_DEADLINE_MS = 15_000;
 const RESPONSE_LIMIT_BYTES = 262_144;
+const BODY_CLEANUP_TIMEOUT_MS = 100;
 const MONTH_SECONDS = 30 * 24 * 60 * 60;
 const USER_AGENT = `quota-axi/${VERSION}`;
 
@@ -55,11 +60,6 @@ type OpenRouterFailureOptions = {
   staleEligible?: boolean;
   definitiveAuth?: boolean;
   retryAfter?: string;
-};
-
-type ResponseBodyLifetime = {
-  markConsumed(): void;
-  cancel(action?: () => Promise<unknown> | undefined): Promise<void>;
 };
 
 export function resolveOpenRouterCredential(
@@ -135,15 +135,12 @@ export const openrouterAdapter = createOpenRouterAdapter();
 async function acquireOpenRouterQuota(
   dependencies: OpenRouterDependencies,
 ): Promise<ProviderQuota> {
-  const controller = new AbortController();
-  const deadline = setTimeout(
-    () => controller.abort(),
-    dependencies.deadlineMs,
-  );
   const attempts: SourceAttempt[] = [];
+  let contextId: string | undefined;
 
   try {
     const resolution = dependencies.credential();
+    contextId = openrouterCredentialContextId(resolution.path);
     if (resolution.status !== "available") {
       const failure = credentialFailureFor(resolution);
       attempts.push({
@@ -151,14 +148,14 @@ async function acquireOpenRouterQuota(
         status: resolution.status === "missing" ? "skipped" : "failed",
         error: failure.code,
       });
-      return failureReport(failure, attempts, dependencies);
+      return failureReport(failure, attempts, contextId, dependencies);
     }
 
     attempts.push({ source: PI_OPENROUTER_SOURCE, status: "failed" });
     const payload = await requestOpenRouterKey(
       resolution.apiKey,
-      controller.signal,
       dependencies.fetch,
+      dependencies.deadlineMs,
       dependencies.now,
     );
     const receivedAt = dependencies.now();
@@ -201,9 +198,7 @@ async function acquireOpenRouterQuota(
         error: failure.code,
       };
     }
-    return failureReport(failure, attempts, dependencies);
-  } finally {
-    clearTimeout(deadline);
+    return failureReport(failure, attempts, contextId, dependencies);
   }
 }
 
@@ -230,19 +225,21 @@ function credentialFailureFor(
 function failureReport(
   failure: OpenRouterFailure,
   attempts: SourceAttempt[],
+  contextId: string | undefined,
   dependencies: OpenRouterDependencies,
 ): ProviderQuota {
-  if (failure.definitiveAuth) {
+  // Without the auth file the reading was scoped to, no snapshot belongs to it.
+  if (failure.definitiveAuth && contextId) {
     try {
-      dependencies.deleteCachedProvider("openrouter");
+      dependencies.deleteCachedProvider(contextId);
     } catch {
       // The current auth failure is still definitive even if the cache is not writable.
     }
   }
 
-  if (failure.staleEligible) {
+  if (failure.staleEligible && contextId) {
     try {
-      const cached = dependencies.readCachedProvider("openrouter");
+      const cached = dependencies.readCachedProvider(contextId);
       const stale = cached
         ? staleOpenRouterReport(
             cached,
@@ -325,14 +322,17 @@ function staleOpenRouterReport(
 
 async function requestOpenRouterKey(
   apiKey: string,
-  signal: AbortSignal,
   fetchImplementation: typeof globalThis.fetch,
+  deadlineMs: number,
   now: () => number,
 ): Promise<unknown> {
-  let response: Response;
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   try {
-    response = await waitForDeadline(
-      fetchImplementation(`https://${OPENROUTER_HOST}${OPENROUTER_KEY_PATH}`, {
+    const fetchPromise = fetchImplementation(
+      `https://${OPENROUTER_HOST}${OPENROUTER_KEY_PATH}`,
+      {
         method: "GET",
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -341,38 +341,34 @@ async function requestOpenRouterKey(
         },
         credentials: "omit",
         redirect: "manual",
-        signal,
-      }),
-      signal,
+        signal: controller.signal,
+      },
     );
-  } catch (error) {
-    if (signal.aborted || isAbortError(error)) {
-      throw new OpenRouterFailure("request_timeout", { staleEligible: true });
-    }
-    throw new OpenRouterFailure(localTransportCode(error), {
-      staleEligible: true,
+    void fetchPromise.then(
+      (response) => {
+        if (timedOut) void cancelResponseBody(response);
+      },
+      () => undefined,
+    );
+    // The deadline rejects on its own schedule, so no cleanup of a stalled
+    // transport can hold the operation past it.
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        reject(timeoutFailure());
+      }, deadlineMs);
     });
-  }
-
-  const lifetime = createResponseBodyLifetime(response);
-  try {
-    const receivedAt = now();
-    rejectHttpFailure(response, receivedAt);
-
-    let bytes: Uint8Array;
-    try {
-      bytes = await readBoundedBody(response, signal, lifetime);
-      lifetime.markConsumed();
-    } catch (error) {
-      if (error instanceof OpenRouterFailure) throw error;
-      if (signal.aborted || isAbortError(error)) {
-        throw new OpenRouterFailure("request_timeout", { staleEligible: true });
-      }
-      throw new OpenRouterFailure("network_unavailable", {
-        staleEligible: true,
-      });
+    const response = await Promise.race([fetchPromise, deadline]);
+    if (response.status !== 200) {
+      await cancelResponseBody(response);
+      rejectHttpFailure(response, now());
     }
 
+    const bytes = await Promise.race([
+      readBoundedBody(response, controller.signal),
+      deadline,
+    ]);
     let text: string;
     try {
       text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -384,14 +380,21 @@ async function requestOpenRouterKey(
     } catch {
       throw new OpenRouterFailure("malformed_json");
     }
+  } catch (error) {
+    if (error instanceof OpenRouterFailure) throw error;
+    if (controller.signal.aborted || isAbortError(error)) {
+      throw timeoutFailure();
+    }
+    throw new OpenRouterFailure(localTransportCode(error), {
+      staleEligible: true,
+    });
   } finally {
-    await lifetime.cancel();
+    if (timeout) clearTimeout(timeout);
   }
 }
 
-function rejectHttpFailure(response: Response, receivedAt: number): void {
+function rejectHttpFailure(response: Response, receivedAt: number): never {
   const status = response.status;
-  if (status === 200) return;
   if (status >= 300 && status <= 399) {
     throw new OpenRouterFailure("redirect_rejected");
   }
@@ -422,102 +425,129 @@ function rejectHttpFailure(response: Response, receivedAt: number): void {
   throw new OpenRouterFailure("provider_request_rejected");
 }
 
+/**
+ * Cancels a response body without letting a stalled transport hold the caller
+ * past a short cleanup bound.
+ */
+async function cancelResponseBody(response: Response): Promise<void> {
+  const body = response.body;
+  if (!body) return;
+  await settleWithin(
+    Promise.resolve()
+      .then(() => body.cancel())
+      .catch(() => undefined),
+  );
+}
+
+/**
+ * Reads the body while counting decoded bytes, so a small declared length
+ * cannot admit an oversized payload.
+ */
 async function readBoundedBody(
   response: Response,
   signal: AbortSignal,
-  lifetime: ResponseBodyLifetime,
 ): Promise<Uint8Array> {
   const declaredLength = response.headers.get("content-length")?.trim();
-  if (declaredLength && /^\d+$/.test(declaredLength)) {
-    if (BigInt(declaredLength) > BigInt(RESPONSE_LIMIT_BYTES)) {
-      throw new OpenRouterFailure("response_too_large", {
-        staleEligible: true,
-      });
-    }
+  if (
+    declaredLength &&
+    /^\d+$/.test(declaredLength) &&
+    BigInt(declaredLength) > BigInt(RESPONSE_LIMIT_BYTES)
+  ) {
+    await cancelResponseBody(response);
+    throw new OpenRouterFailure("response_too_large", { staleEligible: true });
   }
   if (!response.body) return new Uint8Array();
 
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
+  let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
   try {
     while (true) {
-      const { done, value } = await readBodyChunk(reader, signal, lifetime);
-      if (done) break;
-      length += value.length;
+      pendingRead = reader.read();
+      const result = await raceWithAbort(pendingRead, signal);
+      pendingRead = undefined;
+      if (result.done) break;
+      length += result.value.byteLength;
       if (length > RESPONSE_LIMIT_BYTES) {
         throw new OpenRouterFailure("response_too_large", {
           staleEligible: true,
         });
       }
-      chunks.push(value);
+      chunks.push(result.value);
     }
   } finally {
-    reader.releaseLock();
+    if (pendingRead) {
+      await settlePendingRead(reader, pendingRead);
+    } else {
+      // Cancel before releasing the lock: a released reader cannot cancel.
+      void reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
   }
 
   const bytes = new Uint8Array(length);
   let offset = 0;
   for (const chunk of chunks) {
     bytes.set(chunk, offset);
-    offset += chunk.length;
+    offset += chunk.byteLength;
   }
   return bytes;
 }
 
-async function readBodyChunk(
+async function settlePendingRead(
   reader: ReadableStreamDefaultReader<Uint8Array>,
-  signal: AbortSignal,
-  lifetime: ResponseBodyLifetime,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
-  const cancelReader = () => lifetime.cancel(() => reader.cancel());
-  if (signal.aborted) {
-    await cancelReader();
-    throw new OpenRouterFailure("request_timeout", { staleEligible: true });
-  }
-  return new Promise((resolve, reject) => {
-    let aborted = false;
-    const abort = () => {
-      aborted = true;
-      cancelReader().then(() => {
-        reject(
-          new OpenRouterFailure("request_timeout", { staleEligible: true }),
-        );
-      });
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    reader.read().then(
-      (result) => {
-        if (aborted) return;
-        signal.removeEventListener("abort", abort);
-        resolve(result);
-      },
-      (error: unknown) => {
-        if (aborted) return;
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      },
-    );
-  });
+  pendingRead: Promise<ReadableStreamReadResult<Uint8Array>>,
+): Promise<void> {
+  // A pending read owns the stream lock, and releasing it before the read
+  // settles throws. Cancellation is best effort; the lock is released whenever
+  // the read eventually settles, even after this bounded cleanup returns.
+  void Promise.resolve()
+    .then(() => reader.cancel())
+    .catch(() => undefined);
+  const releaseLock = (): void => {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The stream already released or errored the lock.
+    }
+  };
+  await settleWithin(pendingRead.then(releaseLock, releaseLock));
 }
 
-function createResponseBodyLifetime(response: Response): ResponseBodyLifetime {
-  let consumed = false;
-  let cancellation: Promise<void> | undefined;
+async function settleWithin(operation: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      operation,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, BODY_CLEANUP_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
-  return {
-    markConsumed() {
-      if (!cancellation) consumed = true;
-    },
-    async cancel(action = () => response.body?.cancel()) {
-      if (consumed) return;
-      cancellation ??= Promise.resolve()
-        .then(action)
-        .then(() => undefined)
-        .catch(() => undefined);
-      await cancellation;
-    },
-  };
+async function raceWithAbort<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) throw timeoutFailure();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(timeoutFailure());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function timeoutFailure(): OpenRouterFailure {
+  return new OpenRouterFailure("request_timeout", { staleEligible: true });
 }
 
 /**
@@ -530,25 +560,31 @@ function createResponseBodyLifetime(response: Response): ResponseBodyLifetime {
  * Monday-to-Sunday weeks, so a recognized cadence resolves to its current UTC
  * period. The `usage_*` fields are spend meters over the same UTC day, week,
  * and month with no cap of their own, reported as windows without percentages.
+ *
+ * A record is accepted only when every recognized field has its documented
+ * shape and `limit` is present: `null` there is an explicitly unlimited key,
+ * while a missing or malformed field is an unusable response, never an empty
+ * reading that would retire the last good snapshot.
  */
 export function normalizeOpenRouterPayload(
   payload: unknown,
   now: number,
 ): QuotaWindow[] {
-  const root = objectValue(payload);
-  const data = objectValue(root?.data) ?? root;
-  if (!data || !isKeyRecord(data)) {
-    throw new OpenRouterFailure("schema_invalid");
-  }
+  const data = objectValue(objectValue(payload)?.data);
+  if (!data || !Object.hasOwn(data, "limit")) throw schemaInvalid();
+  const limit = nullableNumber(data.limit);
+  const remaining = nullableNumber(data.limit_remaining);
+  const cadenceValue = nullableString(data.limit_reset);
+  spendMeter(data.usage);
 
   const windows: QuotaWindow[] = [];
-  const limit = numericScalar(data.limit);
   if (limit !== undefined) {
-    windows.push(limitWindow(limit, data, now));
+    if (limit < 0 || remaining === undefined) throw schemaInvalid();
+    windows.push(limitWindow(limit, remaining, cadenceValue, now));
   }
   for (const id of OPENROUTER_USAGE_WINDOW_IDS) {
-    const spent = numericScalar(data[id]);
-    if (spent === undefined || spent < 0) continue;
+    const spent = spendMeter(data[id]);
+    if (spent === undefined) continue;
     windows.push({
       id,
       label: USAGE_WINDOWS[id].label,
@@ -557,6 +593,7 @@ export function normalizeOpenRouterPayload(
       ...utcPeriod(USAGE_WINDOWS[id].period, now),
     });
   }
+  if (windows.length === 0) throw schemaInvalid();
   return windows;
 }
 
@@ -606,35 +643,25 @@ function utcPeriod(
 
 function limitWindow(
   limit: number,
-  data: Record<string, unknown>,
+  remaining: number,
+  cadenceValue: string | undefined,
   now: number,
 ): QuotaWindow {
-  const remaining = numericScalar(data.limit_remaining);
-  const cadenceValue = stringValue(data.limit_reset)?.toLowerCase();
+  const cadenceKey = cadenceValue?.toLowerCase();
   const cadence =
-    cadenceValue && Object.hasOwn(LIMIT_RESET_CADENCES, cadenceValue)
-      ? LIMIT_RESET_CADENCES[cadenceValue]
+    cadenceKey && Object.hasOwn(LIMIT_RESET_CADENCES, cadenceKey)
+      ? LIMIT_RESET_CADENCES[cadenceKey]
       : undefined;
   const percentRemaining =
-    limit > 0 && remaining !== undefined
-      ? clampPercent((remaining / limit) * 100)
-      : limit === 0
-        ? 0
-        : undefined;
+    limit > 0 ? clampPercent((remaining / limit) * 100) : 0;
   return {
     id: OPENROUTER_LIMIT_WINDOW_ID,
     // A key limit without a recognized reset cadence is a plain credit cap.
     label: cadence?.label ?? "credits",
     kind: "credits",
-    ...(percentRemaining !== undefined
-      ? {
-          percentRemaining,
-          percentUsed: clampPercent(100 - percentRemaining),
-        }
-      : {}),
-    ...(remaining !== undefined
-      ? { spentUsd: Math.max(0, limit - remaining) }
-      : {}),
+    percentRemaining,
+    percentUsed: clampPercent(100 - percentRemaining),
+    spentUsd: Math.max(0, limit - remaining),
     limitUsd: limit,
     ...(cadence
       ? { ...utcPeriod(cadence.period, now), resetText: cadence.resetText }
@@ -642,18 +669,28 @@ function limitWindow(
   };
 }
 
-const KEY_RECORD_FIELDS = [
-  "limit",
-  "limit_remaining",
-  "limit_reset",
-  "usage",
-  "usage_daily",
-  "usage_weekly",
-  "usage_monthly",
-];
+function schemaInvalid(): OpenRouterFailure {
+  return new OpenRouterFailure("schema_invalid");
+}
 
-function isKeyRecord(data: Record<string, unknown>): boolean {
-  return KEY_RECORD_FIELDS.some((field) => Object.hasOwn(data, field));
+/** A nullable dollar amount: absent or `null` is unreported, anything else must be numeric. */
+function nullableNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const number = numericScalar(value);
+  if (number === undefined) throw schemaInvalid();
+  return number;
+}
+
+function nullableString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw schemaInvalid();
+  return value;
+}
+
+function spendMeter(value: unknown): number | undefined {
+  const spent = nullableNumber(value);
+  if (spent !== undefined && spent < 0) throw schemaInvalid();
+  return spent;
 }
 
 function numericScalar(value: unknown): number | undefined {
@@ -716,38 +753,8 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function stringValue(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
-}
-
-function waitForDeadline<T>(
-  promise: Promise<T>,
-  signal: AbortSignal,
-): Promise<T> {
-  if (signal.aborted) {
-    return Promise.reject(
-      new OpenRouterFailure("request_timeout", { staleEligible: true }),
-    );
-  }
-  return new Promise<T>((resolve, reject) => {
-    const abort = () =>
-      reject(new OpenRouterFailure("request_timeout", { staleEligible: true }));
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      },
-    );
-  });
 }
 
 class OpenRouterFailure extends Error {

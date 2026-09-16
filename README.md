@@ -72,7 +72,7 @@ Default TOON is decision-shaped: `quota[]` carries one fully populated row per m
 $ quota-axi --provider claude --json
 {
   "generatedAt": "2026-03-15T16:42:00.000Z",
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "providers": [
     {
       "provider": "claude",
@@ -352,13 +352,13 @@ CODEX_HOME=/path/to/codex-profile quota-axi --provider codex --profile-only --fu
 
 ## Output Model
 
-The `quota` command's `--json` emits `schemaVersion: 5`.
+The `quota` command's `--json` emits `schemaVersion: 6`.
 
 ### Normalized schema contract
 
 The package publishes TypeScript declarations from its package root, so consumers can use `import type { QuotaAxiResponse, ModelsResponse } from "quota-axi"`. The adapter contract is `ProviderAdapter` in and normalized `ProviderQuota` out: adapters report observed quota data, never rank, mint credentials, or retain raw responses. The narrowly bounded vendor-owned renewal path is documented under [Delegated credential refresh](#delegated-credential-refresh).
 
-`schemaVersion` is command-specific. Additive optional fields do not bump it. A semantic or incompatible shape change does. The `quota` report is version 5, `auth` is version 1, and `models` is version 1.
+`schemaVersion` is command-specific. Additive optional fields do not bump it. A semantic or incompatible shape change does. The `quota` report is version 6 (version 6 added the OpenRouter-only default TOON `spend[]` block), `auth` is version 1, and `models` is version 1.
 
 ### Default report blocks
 
@@ -752,7 +752,8 @@ The Claude and Codex rows describe default discovery; [`--profile-only`](#profil
 
 - It reads one credential: the literal `key` of the `openrouter` `api_key` entry in Pi's `$PI_CODING_AGENT_DIR/auth.json` (default `~/.pi/agent/auth.json`), reported as source `pi:openrouter`. A present entry of any other shape is reported as `invalid` rather than missing, environment, template, and command references are never resolved or executed, and ambient API-key environment variables are not a credential source. quota-axi never writes or manages Pi state.
 - It sends one redirect-disabled `GET` to `https://openrouter.ai/api/v1/auth/key` with the key as a `Bearer` header, a 15 second total deadline, and a 262,144-byte decoded-body cap. The response's key label is discarded; only the limit and usage figures are normalized.
-- OpenRouter cache data is retired only on a definitive credential failure: an absent or invalid Pi entry, an unparseable auth file, or an HTTP 401/403 rejection. An auth file that exists but cannot be read is an indeterminate local failure rather than a sign-out, so it reports `state.status: error` and stays cache-eligible. Timeout, network, 408, 429, 5xx, and oversized-response failures may reuse a formerly fresh snapshot, with each window dropped at its own UTC `resetsAt` boundary, and a limit without a recognized cadence age-bounded at a month.
+- A response is accepted only when `limit` is present and every recognized field (`limit`, `limit_remaining`, `limit_reset`, `usage`, and the `usage_*` meters) has its documented shape: a numeric limit needs a numeric `limit_remaining`, meters are non-negative, and `null` limit is an explicitly unlimited key. A malformed or incomplete record is `schema_invalid`, never an empty fresh reading, so it cannot clear the cached snapshot.
+- OpenRouter cache data is retired only on a definitive credential failure: an absent or invalid Pi entry, an unparseable auth file, or an HTTP 401/403 rejection. An auth file that exists but cannot be read is an indeterminate local failure rather than a sign-out, so it reports `state.status: error` and stays cache-eligible. Timeout, network, 408, 429, 5xx, and oversized-response failures may reuse a formerly fresh snapshot, with each window dropped at its own UTC `resetsAt` boundary, and a limit without a recognized cadence age-bounded at a month. Both reuse and retirement are scoped to the Pi auth file the key came from (see [Cache](#cache)), so one Pi profile never serves or deletes another's snapshot.
 - It never launches Pi, refreshes or writes credentials, sends cookies, or retains raw responses. The API key does not expire, so there is nothing to renew and OpenRouter has no delegated refresh.
 
 **Antigravity**
@@ -830,6 +831,7 @@ Providers with no established non-interactive rotation command stay read-only on
 | Codex cache identities                 | Cached Codex windows are accepted only when ID, label, kind, duration, and duplicate suffix order agree; stale snapshots with mismatched identities are rejected.                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Grok cache provenance                  | Only snapshots produced by the current `web` consumer operation can be used as Grok stale fallback; legacy `api` billing-proxy snapshots are rejected.                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | Kimi cache provenance                  | Follows the [Kimi provider rules](#provider-notes): a snapshot is reused only when its opaque SHA-256 identifier still matches the source that produced it - the selected Kimi Code environment, or the Pi source and its default endpoint - and legacy context-less Kimi records are not reused.                                                                                                                                                                                                                                                                            |
+| OpenRouter cache provenance            | A snapshot carries an opaque SHA-256 identifier of the Pi auth file whose key produced it; stale reuse and credential-failure retirement act only on the snapshot with the matching identifier.                                                                                                                                                                                                                                                                                                                                                                              |
 
 ## Development
 

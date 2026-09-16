@@ -3,6 +3,7 @@ import {
   cacheFilePath,
   claudeCredentialContextId,
   ensurePrivateParent,
+  openrouterCredentialContextId,
   readJsonFile,
 } from "./lib/fs.js";
 import { kimiReadingContextId } from "./providers/kimi-cache-context.js";
@@ -59,13 +60,15 @@ const CREDENTIAL_CONTEXT_ID = /^[a-f0-9]{64}$/;
  * and a Kimi reading need not come from that configuration in the first place,
  * because Pi brokers a credential for the default endpoint while naming no
  * deployment. Kimi therefore reports the identity of whatever actually produced
- * its reading.
+ * its reading. An OpenRouter key is selected by the Pi auth file this process
+ * resolves, which, like a Claude profile, is fixed by its own environment.
  */
 const CONTEXT_SCOPED_PROVIDERS: Partial<
   Record<ProviderId, () => string | undefined>
 > = {
   claude: claudeCredentialContextId,
   kimi: kimiReadingContextId,
+  openrouter: () => openrouterCredentialContextId(),
 };
 
 type CachedProvider = {
@@ -101,6 +104,16 @@ export function readCachedKimiProvider(
   contextId: string,
 ): ProviderQuota | undefined {
   return readCachedProviderInContext("kimi", contextId);
+}
+
+/**
+ * OpenRouter stale quota may only be reused when the cache record proves it was
+ * captured with the key of the same Pi auth file.
+ */
+export function readCachedOpenRouterProvider(
+  contextId: string,
+): ProviderQuota | undefined {
+  return readCachedProviderInContext("openrouter", contextId);
 }
 
 function readCachedProviderInContext(
@@ -155,6 +168,21 @@ export function deleteCachedProvider(provider: ProviderId): void {
     cacheFilePath(),
     existing.filter((item) => item.snapshot.provider !== provider),
   );
+}
+
+/**
+ * Retires an OpenRouter snapshot only when it belongs to the Pi auth file whose
+ * key was just found unusable; another profile's snapshot is left in place.
+ */
+export function deleteCachedOpenRouterProvider(contextId: string): void {
+  const existing = readCacheProviders();
+  const retained = existing.filter(
+    (item) =>
+      item.snapshot.provider !== "openrouter" ||
+      item.credentialContextId !== contextId,
+  );
+  if (retained.length === existing.length) return;
+  writeCacheFile(cacheFilePath(), retained);
 }
 
 function writeCacheFile(file: string, providers: CachedProvider[]): void {

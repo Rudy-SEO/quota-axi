@@ -1,7 +1,12 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  readCachedOpenRouterProvider,
+  writeCachedProviders,
+} from "../../src/cache.js";
+import { openrouterCredentialContextId } from "../../src/lib/fs.js";
 import {
   createOpenRouterAdapter,
   normalizeOpenRouterPayload,
@@ -191,6 +196,137 @@ describe("OpenRouter request transport", () => {
     }).fetchQuota(OPTIONS);
 
     expect(report.state.error).toBe("request_timeout");
+  });
+
+  it("times out a stalled body read at the deadline and releases the reader later", async () => {
+    let resolveRead:
+      | ((result: ReadableStreamReadResult<Uint8Array>) => void)
+      | undefined;
+    let readSettled = false;
+    const cancel = vi.fn(async () => undefined);
+    const releaseLock = vi.fn(() => {
+      if (!readSettled) throw new Error("read_pending");
+    });
+    const report = await testAdapter({
+      deadlineMs: 10,
+      fetch: vi.fn(async () =>
+        stubResponse({
+          getReader: () => ({
+            read: () =>
+              new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+                resolveRead = resolve;
+              }),
+            cancel,
+            releaseLock,
+          }),
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.state).toMatchObject({
+      status: "error",
+      error: "request_timeout",
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+
+    readSettled = true;
+    resolveRead?.({ done: true, value: undefined });
+    await vi.waitFor(() => expect(releaseLock).toHaveBeenCalled());
+  });
+
+  it("returns a timeout even when cancellation and the pending read both stall", async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const startedAt = Date.now();
+    const report = await testAdapter({
+      deadlineMs: 10,
+      fetch: vi.fn(async () =>
+        stubResponse({
+          getReader: () => ({
+            read: () =>
+              new Promise<ReadableStreamReadResult<Uint8Array>>(
+                () => undefined,
+              ),
+            cancel,
+            releaseLock: vi.fn(),
+          }),
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.state).toMatchObject({
+      status: "error",
+      error: "request_timeout",
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  it("does not wait on a stalled cancellation of a rejected response body", async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const report = await testAdapter({
+      fetch: vi.fn(async () => stubResponse({ cancel }, 503)),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.state.error).toBe("provider_unavailable");
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("caps decoded body bytes even when the declared length is small", async () => {
+    let cancellations = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(262_145));
+      },
+      cancel() {
+        cancellations += 1;
+      },
+    });
+    const report = await testAdapter({
+      fetch: vi.fn(
+        async () => new Response(body, { headers: { "content-length": "16" } }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.state).toMatchObject({
+      status: "error",
+      error: "response_too_large",
+    });
+    await vi.waitFor(() => expect(cancellations).toBe(1));
+  });
+
+  it("does not wait on stalled reader cleanup after an oversized chunk", async () => {
+    const report = await testAdapter({
+      fetch: vi.fn(async () =>
+        stubResponse({
+          getReader: () => ({
+            read: async () => ({
+              done: false,
+              value: new Uint8Array(262_145),
+            }),
+            cancel: () => new Promise<never>(() => undefined),
+            releaseLock: vi.fn(),
+          }),
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.state.error).toBe("response_too_large");
+  });
+
+  it("rejects an oversized declared length without reading and bounds its cancellation", async () => {
+    const getReader = vi.fn();
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const report = await testAdapter({
+      fetch: vi.fn(async () =>
+        stubResponse({ getReader, cancel }, 200, {
+          "content-length": "262145",
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.state.error).toBe("response_too_large");
+    expect(getReader).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("rejects invalid UTF-8, malformed JSON, and invalid schema", async () => {
@@ -414,45 +550,39 @@ describe("OpenRouter payload normalization", () => {
     });
   });
 
-  it("omits percentages when the remaining limit is not reported", () => {
-    const [window] = normalizeOpenRouterPayload(
-      {
-        data: { limit: 80, limit_reset: "daily" },
-      },
-      NOW,
+  it.each([
+    ["a record outside the data envelope", { limit: 10, limit_remaining: 5 }],
+    ["a record without limit", { data: { limit_reset: "daily" } }],
+    [
+      "a limit without its remaining amount",
+      { data: { limit: 80, limit_reset: "daily", usage_daily: 1 } },
+    ],
+    [
+      "a non-numeric limit",
+      { data: { limit: "eighty", limit_remaining: 5, usage_daily: 1 } },
+    ],
+    ["a negative limit", { data: { limit: -1, limit_remaining: 0 } }],
+    [
+      "a non-string reset cadence",
+      { data: { limit: 10, limit_remaining: 5, limit_reset: 1 } },
+    ],
+    [
+      "a non-numeric lifetime usage",
+      { data: { limit: null, usage: {}, usage_daily: 1 } },
+    ],
+    [
+      "a negative usage meter",
+      { data: { limit: 10, limit_remaining: 5, usage_daily: -1 } },
+    ],
+    [
+      "a non-numeric usage meter",
+      { data: { limit: 10, limit_remaining: 5, usage_weekly: "n/a" } },
+    ],
+    ["an unlimited key with no usage meters", { data: { limit: null } }],
+  ])("throws schema_invalid for %s", (_label, payload) => {
+    expect(() => normalizeOpenRouterPayload(payload, NOW)).toThrow(
+      "schema_invalid",
     );
-    expect(window).toMatchObject({ id: "limit", limitUsd: 80 });
-    expect(window.percentRemaining).toBeUndefined();
-    expect(window.percentUsed).toBeUndefined();
-    expect(window.spentUsd).toBeUndefined();
-  });
-
-  it("tolerates a missing envelope by reading the record from the root", () => {
-    const windows = normalizeOpenRouterPayload(
-      {
-        limit: 10,
-        limit_remaining: 5,
-        limit_reset: "daily",
-      },
-      NOW,
-    );
-    expect(windows.map(({ id }) => id)).toEqual(["limit"]);
-  });
-
-  it("skips negative and non-numeric usage meters", () => {
-    const windows = normalizeOpenRouterPayload(
-      {
-        data: {
-          limit: 10,
-          limit_remaining: 5,
-          usage_daily: -1,
-          usage_weekly: "not-a-number",
-          usage_monthly: 3,
-        },
-      },
-      NOW,
-    );
-    expect(windows.map(({ id }) => id)).toEqual(["limit", "usage_monthly"]);
   });
 
   it("throws schema_invalid for a record with no recognized field", () => {
@@ -566,7 +696,7 @@ describe("OpenRouter credential discovery", () => {
     }).fetchQuota(OPTIONS);
 
     expect(request).not.toHaveBeenCalled();
-    expect(remove).toHaveBeenCalledWith("openrouter");
+    expect(remove).toHaveBeenCalledWith(openrouterCredentialContextId(PI_PATH));
     expect(report.state).toMatchObject({
       status: "auth_required",
       stale: false,
@@ -597,7 +727,7 @@ describe("OpenRouter credential discovery", () => {
     }).fetchQuota(OPTIONS);
 
     expect(request).not.toHaveBeenCalled();
-    expect(remove).toHaveBeenCalledWith("openrouter");
+    expect(remove).toHaveBeenCalledWith(openrouterCredentialContextId(PI_PATH));
     expect(report.state).toMatchObject({
       status: "auth_required",
       error: "openrouter_credential_invalid",
@@ -640,7 +770,7 @@ describe("OpenRouter cache fallback", () => {
       readCachedProvider: () => cachedQuota(),
     }).fetchQuota(OPTIONS);
 
-    expect(remove).toHaveBeenCalledWith("openrouter");
+    expect(remove).toHaveBeenCalledWith(openrouterCredentialContextId(PI_PATH));
     expect(report.state).toMatchObject({
       status: "auth_required",
       error: "provider_auth_rejected",
@@ -675,6 +805,61 @@ describe("OpenRouter cache fallback", () => {
     expect(report.state.status).toBe("error");
     expect(report.state.error).toBe("malformed_json");
     expect(report.source).toBe("unavailable");
+  });
+
+  it("keeps the previous snapshot when a recognized field is malformed", async () => {
+    await withPiProfiles(async ({ profileA }) => {
+      process.env.PI_CODING_AGENT_DIR = profileA;
+      const contextId = openrouterCredentialContextId();
+      writeCachedProviders([await liveAdapter(jsonResponse(KEY_PAYLOAD))]);
+      expect(readCachedOpenRouterProvider(contextId)).toBeDefined();
+
+      for (const payload of [
+        { data: { limit_reset: "daily" } },
+        { data: { ...KEY_PAYLOAD.data, usage_daily: "unknown" } },
+      ]) {
+        const report = await liveAdapter(jsonResponse(payload));
+        expect(report.state).toMatchObject({
+          status: "error",
+          error: "schema_invalid",
+        });
+        writeCachedProviders([report]);
+        expect(readCachedOpenRouterProvider(contextId)).toBeDefined();
+      }
+    });
+  });
+
+  it("never reads or retires another Pi profile's snapshot", async () => {
+    await withPiProfiles(async ({ profileA, profileB }) => {
+      process.env.PI_CODING_AGENT_DIR = profileA;
+      const contextA = openrouterCredentialContextId();
+      writeCachedProviders([await liveAdapter(jsonResponse(KEY_PAYLOAD))]);
+
+      process.env.PI_CODING_AGENT_DIR = profileB;
+      for (const response of [
+        () => new Response(null, { status: 429 }),
+        () => new Response(null, { status: 503 }),
+        () => new Response(null, { status: 401 }),
+      ]) {
+        const report = await liveAdapter(response());
+        expect(report.source).toBe("unavailable");
+        expect(report.windows).toEqual([]);
+        expect(readCachedOpenRouterProvider(contextA)).toBeDefined();
+      }
+      const timedOut = await liveAdapter(
+        new Promise<Response>(() => undefined),
+      );
+      expect(timedOut.state.error).toBe("request_timeout");
+      expect(timedOut.windows).toEqual([]);
+
+      process.env.PI_CODING_AGENT_DIR = profileA;
+      const stale = await liveAdapter(new Response(null, { status: 503 }));
+      expect(stale.source).toBe("cache");
+      expect(stale.state.status).toBe("stale");
+
+      await liveAdapter(new Response(null, { status: 401 }));
+      expect(readCachedOpenRouterProvider(contextA)).toBeUndefined();
+    });
   });
 
   it("expires cached windows at their UTC reset boundaries", async () => {
@@ -772,6 +957,69 @@ describe("OpenRouter auth inspection", () => {
 });
 
 const PI_PATH = "/home/user/.pi/agent/auth.json";
+const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+const originalPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+afterEach(() => {
+  restoreEnv("XDG_CACHE_HOME", originalXdgCacheHome);
+  restoreEnv("PI_CODING_AGENT_DIR", originalPiAgentDir);
+});
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+/** Two Pi profiles, each holding its own key, sharing one temporary cache. */
+async function withPiProfiles(
+  assertion: (profiles: {
+    profileA: string;
+    profileB: string;
+  }) => Promise<void>,
+): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "quota-axi-openrouter-"));
+  try {
+    process.env.XDG_CACHE_HOME = join(directory, "cache");
+    const profiles = {
+      profileA: join(directory, "profile-a"),
+      profileB: join(directory, "profile-b"),
+    };
+    for (const profile of Object.values(profiles)) {
+      mkdirSync(profile);
+      writeFileSync(
+        join(profile, "auth.json"),
+        JSON.stringify({ openrouter: { type: "api_key", key: SYNTHETIC_KEY } }),
+      );
+    }
+    await assertion(profiles);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/** The adapter with its real credential and cache boundaries and one stubbed response. */
+function liveAdapter(
+  response: Response | Promise<Response>,
+): Promise<ProviderQuota> {
+  return createOpenRouterAdapter({
+    fetch: vi.fn(async () => response) as unknown as typeof fetch,
+    now: () => NOW,
+    deadlineMs: 10,
+  }).fetchQuota(OPTIONS);
+}
+
+function stubResponse(
+  body: Record<string, unknown>,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers(headers),
+    body,
+  } as unknown as Response;
+}
 
 function testAdapter(
   overrides: Partial<Parameters<typeof createOpenRouterAdapter>[0]> = {},

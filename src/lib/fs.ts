@@ -6,6 +6,7 @@ import {
   claudeEnvOauthToken,
   claudeProfileLocations,
 } from "./claude-profile.js";
+import { resolvePiAuthFilePath } from "./pi-agent-dir.js";
 
 export type JsonFileReadResult =
   | { status: "success"; value: unknown }
@@ -78,6 +79,19 @@ export function claudeCredentialContextId(): string {
         ...(envSelected ? ["env-token"] : []),
       ]),
     )
+    .digest("hex");
+}
+
+/**
+ * An opaque, deterministic cache-provenance identifier for the Pi auth file an
+ * OpenRouter reading's key came from. Each Pi profile stores its own key, so a
+ * snapshot from one profile says nothing about another.
+ */
+export function openrouterCredentialContextId(
+  authFilePath: string = resolvePiAuthFilePath(),
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(["openrouter-pi-v1", resolve(authFilePath)]))
     .digest("hex");
 }
 
