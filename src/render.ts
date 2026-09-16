@@ -64,9 +64,9 @@ type AttentionRow = {
 };
 
 /**
- * Sparse: one row per fresh window that reports a dollar figure, so a spend
- * meter without a percentage is still visible. `limitUsd` is `none` for a
- * meter with neither a limit nor a percentage.
+ * Sparse: one row per fresh OpenRouter window, so its dollar spend meters stay
+ * visible beside the limit's percentage. `limitUsd` is `none` for an uncapped
+ * meter.
  */
 type SpendRow = {
   provider: ProviderId;
@@ -85,7 +85,7 @@ type ProviderBlocks = {
 /**
  * Render the default decision-shaped report: one `quota[]` row per measurable
  * scope, plus the sparse `exhaustion[]` and `attention[]` blocks, and a
- * `spend[]` block only when a fresh window reports dollars. `--full` adds the
+ * `spend[]` block only when fresh OpenRouter windows report dollars. `--full` adds the
  * audit blocks. Demotion happens here, never at computation, so `--tui` and
  * the normalized model keep every field.
  */
@@ -168,7 +168,7 @@ function quotaBlocks(response: QuotaAxiResponse): ProviderBlocks {
 }
 
 function spendRows(provider: ProviderQuota): SpendRow[] {
-  if (provider.state.stale) return [];
+  if (provider.provider !== "openrouter" || provider.state.stale) return [];
   return provider.windows
     .filter(
       ({ spentUsd, limitUsd }) =>
@@ -237,6 +237,25 @@ function providerAttention(
   return [
     ...providerStateRows(provider, measured, scopeRows),
     ...degradedSourceRows(provider),
+    ...unreportedBoundRows(provider),
+  ];
+}
+
+/**
+ * OpenRouter's account credit balance can refuse paid requests before the key
+ * limit does, and the key-status endpoint does not report it.
+ */
+function unreportedBoundRows(provider: ProviderQuota): AttentionRow[] {
+  if (provider.provider !== "openrouter" || provider.state.status !== "fresh")
+    return [];
+  return [
+    {
+      provider: provider.provider,
+      scope: "all",
+      kind: "unreported_bound",
+      detail: "account_credits",
+      remedy: NONE,
+    },
   ];
 }
 

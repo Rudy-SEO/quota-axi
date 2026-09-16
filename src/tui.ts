@@ -231,7 +231,14 @@ function buildLiveCard(provider: ProviderQuota, generatedAtMs: number): Card {
   if (provider.windows.length > 0) {
     lines.push(interior([], "border"));
     for (const window of provider.windows) {
-      lines.push(interior(windowRow(window, generatedAtMs), "border"));
+      lines.push(
+        interior(
+          isSpendMeter(provider, window)
+            ? spendMeterRow(window, generatedAtMs)
+            : windowRow(window, generatedAtMs),
+          "border",
+        ),
+      );
     }
   }
 
@@ -445,28 +452,32 @@ function interior(content: Line, borderStyle: StyleName): Line {
   ];
 }
 
+function spendMeterRow(window: QuotaWindow, generatedAtMs: number): Line {
+  return [
+    { text: "   " },
+    ...padBetween(
+      [
+        {
+          text: sanitizeTerminalText(window.label).toLowerCase(),
+          style: "label",
+        },
+      ],
+      [{ text: spendAmount(window), style: "dim" }],
+      8 + WINDOW_BAR_WIDTH + 5,
+    ),
+    { text: "  " },
+    {
+      text: padEndDisplay(resetCountdown(window, generatedAtMs), 6),
+      style: "dim",
+    },
+    { text: " " },
+  ];
+}
+
 function windowRow(window: QuotaWindow, generatedAtMs: number): Line {
   const pct = window.percentRemaining;
   const marker = window.pace?.timeRemainingPercent;
   const reset = resetCountdown(window, generatedAtMs);
-  if (isSpendMeter(window)) {
-    return [
-      { text: "   " },
-      ...padBetween(
-        [
-          {
-            text: sanitizeTerminalText(window.label).toLowerCase(),
-            style: "label",
-          },
-        ],
-        [{ text: spendAmount(window), style: "dim" }],
-        8 + WINDOW_BAR_WIDTH + 5,
-      ),
-      { text: "  " },
-      { text: padEndDisplay(reset, 6), style: "dim" },
-      { text: " " },
-    ];
-  }
   return [
     { text: "   " },
     { text: padEndDisplay(shortWindowLabel(window), 8), style: "label" },
@@ -570,11 +581,31 @@ function runwayVerdict(headline: EffectiveAvailability | undefined): Line {
 }
 
 /**
- * A dollar meter with no percentage: its row shows the amount in place of an
- * empty bar, under its full label so it never reads as the capped window.
+ * An OpenRouter dollar meter with no percentage: its row shows the amount in
+ * place of an empty bar, under its full label so it never reads as the capped
+ * window.
  */
-function isSpendMeter(window: QuotaWindow): boolean {
-  return window.percentRemaining === undefined && window.spentUsd !== undefined;
+function isSpendMeter(provider: ProviderQuota, window: QuotaWindow): boolean {
+  return (
+    provider.provider === "openrouter" &&
+    window.percentRemaining === undefined &&
+    window.spentUsd !== undefined
+  );
+}
+
+function openRouterNotes(provider: ProviderQuota): string[] {
+  return [
+    ...provider.windows
+      .filter(
+        (window) =>
+          window.limitUsd !== undefined && !isSpendMeter(provider, window),
+      )
+      .map(
+        (window) =>
+          `${sanitizeTerminalText(window.label).toLowerCase()}: ${spendAmount(window)}`,
+      ),
+    "account credit balance not reported",
+  ];
 }
 
 function spendAmount(window: QuotaWindow): string {
@@ -589,12 +620,8 @@ function usd(value: number): string {
 }
 
 function cardNotes(provider: ProviderQuota): string[] {
-  const notes: string[] = provider.windows
-    .filter((window) => window.limitUsd !== undefined && !isSpendMeter(window))
-    .map(
-      (window) =>
-        `${sanitizeTerminalText(window.label).toLowerCase()}: ${spendAmount(window)}`,
-    );
+  const notes =
+    provider.provider === "openrouter" ? openRouterNotes(provider) : [];
   if (provider.state.retryAfter) {
     notes.push(`retry after ${provider.state.retryAfter}`);
   }

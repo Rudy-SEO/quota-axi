@@ -1109,32 +1109,70 @@ describe("default TOON decision blocks", () => {
     expect(kinds).toContainEqual(["untrusted_windows", "unparsed_limit_2"]);
   });
 
-  it("shows OpenRouter dollars in spend[] and its unreported credit bound in attention[]", async () => {
+  it("reports OpenRouter's key limit in quota[] with dollars in spend[] and the credit caveat in attention[]", async () => {
     useTempCache();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-06T18:10:00.000Z"));
     PROVIDERS.openrouter = providerWithQuota(freshOpenRouterQuota());
 
     const output = await capture(["--provider", "openrouter"]);
 
-    expect(toonRows(output, "quota")).toEqual([]);
+    expect(toonRows(output, "quota")).toEqual([
+      [
+        "openrouter",
+        "all_models",
+        "75",
+        expect.any(String),
+        "through_reset",
+        expect.any(String),
+        "limit",
+        "2026-07-07T00:00:00.000Z",
+      ],
+    ]);
+    expect(toonRows(output, "quota")[0]?.[3]).not.toBe("unknown");
     expect(toonRows(output, "spend")).toEqual([
       ["openrouter", "limit", "20", "80"],
       ["openrouter", "usage_monthly", "480.75", "none"],
     ]);
-    const kinds = toonRows(output, "attention").map((row) => [row[2], row[3]]);
-    expect(kinds).toContainEqual(["unresolved_windows", "account_credits"]);
-    expect(kinds).toContainEqual([
-      "headroom_unknown",
-      "limit + account_credits",
+    expect(toonRows(output, "attention")).toEqual([
+      ["openrouter", "all", "unreported_bound", "account_credits", "none"],
     ]);
   });
 
-  it("omits spend[] when no fresh window reports dollars", async () => {
+  it("leaves Claude and Cursor dollar windows out of spend[] and attention[]", async () => {
     useTempCache();
-    PROVIDERS.codex = providerWithQuota(freshCodexQuota());
+    PROVIDERS.claude = providerWithQuota({
+      ...freshClaudeQuota(),
+      windows: [
+        ...freshClaudeQuota().windows,
+        {
+          id: "extra_usage",
+          label: "extra usage",
+          kind: "credits",
+          spentUsd: 5,
+          limitUsd: 50,
+        },
+      ],
+    });
+    PROVIDERS.cursor = providerWithQuota({
+      ...cursorWithUnfamiliarWindow(),
+      windows: [
+        {
+          id: "spend_limit",
+          label: "spend limit",
+          kind: "credits",
+          percentUsed: 40,
+          percentRemaining: 60,
+          spentUsd: 8,
+          limitUsd: 20,
+        },
+      ],
+    });
 
-    const output = await capture(["--provider", "codex"]);
+    const output = await capture(["--provider", "claude,cursor"]);
 
     expect(output).not.toContain("spend[");
+    expect(output).not.toContain("unreported_bound");
   });
 
   it("drops the audit blocks and the duplicate selection block", async () => {

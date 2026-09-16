@@ -754,7 +754,7 @@ describe("quota semantics", () => {
     ]);
   });
 
-  it("keeps OpenRouter's key-limit headroom unknown behind the unreported account credit", () => {
+  it("bounds OpenRouter models by the key limit with pace from its UTC day", () => {
     const result = withQuotaSemantics(
       provider("openrouter", [
         {
@@ -789,36 +789,21 @@ describe("quota semantics", () => {
       GENERATED_AT,
     );
 
-    expect(result.quotaSemantics?.status).toBe("partial");
+    expect(result.quotaSemantics?.status).toBe("known");
     expect(result.quotaSemantics?.description).toContain("credit balance");
-    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual([
-      "account_credits",
-    ]);
-    const limit = result.windows.find(({ id }) => id === "limit");
-    expect(limit?.pace).toMatchObject({
-      status: "behind",
-      cycleSeconds: 86_400,
-    });
+    expect(result.quotaSemantics?.unresolvedWindowIds).toBeUndefined();
     expect(result.quotaSemantics?.effectiveAvailability).toEqual([
       expect.objectContaining({
         scope: "all_models",
-        status: "unknown",
+        status: "known",
+        effectivePercentRemaining: 75,
         boundedBy: ["limit"],
+        limitingWindowIds: ["limit"],
         pace: expect.objectContaining({ status: "behind" }),
-        runway: {
-          status: "unknown",
-          unmeasurableWindowIds: ["limit", "account_credits"],
-        },
-        selection: {
-          status: "unknown",
-          unmeasurableWindowIds: ["limit", "account_credits"],
-        },
+        runway: expect.objectContaining({ status: "through_reset" }),
+        selection: expect.not.objectContaining({ status: "unknown" }),
       }),
     ]);
-    expect(
-      result.quotaSemantics?.effectiveAvailability[0]
-        ?.effectivePercentRemaining,
-    ).toBeUndefined();
   });
 
   it("reports no OpenRouter availability for an unlimited key's usage meters", () => {
@@ -835,11 +820,9 @@ describe("quota semantics", () => {
       GENERATED_AT,
     );
 
-    expect(result.quotaSemantics?.status).toBe("partial");
+    expect(result.quotaSemantics?.status).toBe("unknown");
     expect(result.quotaSemantics?.effectiveAvailability).toEqual([]);
-    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual([
-      "account_credits",
-    ]);
+    expect(result.quotaSemantics?.unresolvedWindowIds).toBeUndefined();
   });
 
   it("keeps an unfamiliar OpenRouter window out of the key-limit bound", () => {
@@ -852,10 +835,7 @@ describe("quota semantics", () => {
     );
 
     expect(result.quotaSemantics?.status).toBe("partial");
-    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual([
-      "mystery",
-      "account_credits",
-    ]);
+    expect(result.quotaSemantics?.unresolvedWindowIds).toEqual(["mystery"]);
     expect(result.quotaSemantics?.effectiveAvailability).toEqual([
       expect.objectContaining({
         scope: "all_models",
@@ -863,11 +843,11 @@ describe("quota semantics", () => {
         boundedBy: ["limit"],
         runway: {
           status: "unknown",
-          unmeasurableWindowIds: ["limit", "mystery", "account_credits"],
+          unmeasurableWindowIds: ["limit", "mystery"],
         },
         selection: {
           status: "unknown",
-          unmeasurableWindowIds: ["limit", "mystery", "account_credits"],
+          unmeasurableWindowIds: ["limit", "mystery"],
         },
       }),
     ]);

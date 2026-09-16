@@ -842,9 +842,56 @@ describe("cards for dollar spend meters", () => {
     expect(findLine(lines, "week usage")).toContain("$95.50 spent");
     expect(findLine(lines, "month usage")).toContain("$480.75 spent");
     expect(findLine(lines, "day: ")).toContain("$20.00 of $80.00 spent");
+    expect(lines.some((line) => line.includes("account credit balance"))).toBe(
+      true,
+    );
     for (const line of lines.filter((line) => line.includes("usage"))) {
       expect(line).not.toContain("?");
     }
+  });
+
+  it("renders Claude and Cursor dollar windows without spend rows or notes", () => {
+    const claude = claudeProvider();
+    claude.windows.push({
+      id: "extra_usage",
+      label: "extra usage",
+      kind: "credits",
+      spentUsd: 5,
+    });
+    const cursor = withQuotaSemantics(
+      {
+        provider: "cursor",
+        label: "Cursor",
+        source: "api",
+        windows: [
+          {
+            id: "spend_limit",
+            label: "spend limit",
+            kind: "credits",
+            percentUsed: 40,
+            percentRemaining: 60,
+            spentUsd: 8,
+            limitUsd: 20,
+          },
+        ],
+        state: { status: "fresh", stale: false, sourcesTried: ["state-vscdb"] },
+      },
+      GENERATED_AT,
+    );
+    const output = stripAnsi(
+      renderQuotaTui(
+        {
+          generatedAt: GENERATED_AT,
+          schemaVersion: 5,
+          providers: [withQuotaSemantics(claude, GENERATED_AT), cursor],
+        },
+        { timeZone: "America/Los_Angeles", columns: CARD_COLUMNS },
+      ),
+    );
+
+    expect(output).not.toContain("$");
+    expect(output).not.toContain("account credit balance");
+    expect(findLine(output.split("\n"), "extra")).toContain("?");
   });
 
   it("keeps an unlimited key's spend visible", () => {
